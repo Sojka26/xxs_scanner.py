@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+from collections import deque
+from pathlib import Path
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
+
+import requests
+from bs4 import BeautifulSoup
+
+
+DOM_SOURCES = [
+    r"\blocation\.hash\b",
+    r"\blocation\.search\b",
+    r"\blocation\.href\b",
+    r"\bdocument\.URL\b",
+    r"\bdocument\.documentURI\b",
+    r"\bdocument\.referrer\b",
+    r"\bwindow\.name\b",
+    r"\blocalStorage\b",
+    r"\bsessionStorage\b",
+    r"\bpostMessage\b",
+]
+
+DOM_SINKS = [
+    r"\.innerHTML\s*=",
+    r"\.outerHTML\s*=",
+    r"\binsertAdjacentHTML\s*\(",
+    r"\bdocument\.write\s*\(",
+    r"\bdocument\.writeln\s*\(",
+    r"\beval\s*\(",
+    r"\bsetTimeout\s*\(",
+    r"\bsetInterval\s*\(",
+    r"\bFunction\s*\(",
+]
+
+URL_ATTRS = ["href", "src", "action"]
+
+
+class XSSScanner:
+    def __init__(self, base_url, max_pages=50, timeout=10):
+        self.base_url = self.normalize_url(base_url)
+        self.origin = self.get_origin(self.base_url)
+
+        self.max_pages = max_pages
+        self.timeout = timeout
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Authorized-XSS-Candidate-Scanner/1.0"
+        })
+
+        self.visited = set()
+        self.findings = []
+
+    @staticmethod
+    def normalize_url(url):
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return url
+
+    @staticmethod
+    def get_origin(url):
+        p = urlparse(url)
+        return f"{p.scheme}://{p.netloc}"
+
+    def same_origin(self, url):
+        return self.get_origin(url) == self.origin
+
+    def add_finding(self, kind, url, evidence):
+        item = {
+            "type": kind,
+            "url": url,
+            "evidence": evidence.strip(),
+        }
+
+        if item not in self.findings:
+            self.findings.append(item)
+
+    def request(self, url):
+        try:
+            return self.session.get(
+                url,
+                timeout=self.timeout,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            print(f"[!] Request failed: {url}: {exc}")
+            return None
+
+    def inspect_dom_xss(self, url, javascript):
+        sources = []
+        sinks = []
+
+        for pattern in DOM_SOURCES:
+            if re.search(pattern, javascript, re.I):
+                sources.append(pattern)
+
+        for pattern in DOM_SINKS:
+            if re.search(pattern, javascript, re.I):
+                sinks.append(pattern)
+
+        if sources and sinks:
+            self.add_finding(
+                "DOM XSS candidate",
+                url,
+                "Source(s): "
+                + ", ".join(sources)
+                + " | Sink(s): "
+                + ", ".join(sinks),
+            )
+
+    def inspect_inline_scripts(self, soup, page_url):
+        for script in soup.find_all("script"):
+            if script.get("src"):
+                continue
+
+            code = script.get_text(" ", strip=False)
+
+            if code:
+                self.inspect_dom_xss(page_url, code)
+
+    def inspect_external_scripts(self, soup, page_url):
+        for script in soup.find_all("script", src=True):
+            js_url = urljoin(page_url, script["src"])
+
+            if not self.same_origin(js_url):
+                continue
+
+            response = self.request(js_url)
+
+            if not response:
+                continue
+
+            self.inspect_dom_xss(js_url, response.text)
+
+    def inspect_forms(self, soup, page_url):
+        for form in soup.find_all("form"):
+            action = urljoin(
+                page_url,
+                form.get("action") or page_url,
+            )
+
+            method = (
+                form.get("method")
+                or "GET"
+            ).upper()
+
+            fields = []
+
+            for field in form.find_all(
+                ["input", "textarea", "select"]
+            ):
+                name = field.get("name")
+
+                if name:
+                    fields.append(name)
+
+            if fields:
+                self.add_finding(
+                    "Input surface",
+                    action,
+                    f"{method} form fields: "
+                    + ", ".join(fields),
+                )
+
+    def inspect_reflection(self, url):
+        parsed = urlparse(url)
+        params = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+
+        if not params:
+            return
+
+        marker = "XSSCANDIDATE82461"
+
+        for index, (name, value) in enumerate(params):
+            mutated = list(params)
+            mutated[index] = (name, marker)
+
+            query = urlencode(mutated)
+
+            test_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                query,
+                parsed.fragment,
+            ))
+
+            response = self.request(test_url)
+
+            if not response:
+                continue
+
+            if marker in response.text:
+                self.add_finding(
+                    "Reflected XSS candidate",
+                    test_url,
+                    f"Parameter '{name}' reflected "
+                    "into response",
+                )
+
+    def extract_links(self, soup, page_url):
+        links = set()
+
+        for tag in soup.find_all(True):
+            for attr in URL_ATTRS:
+                value = tag.get(attr)
+
+                if not value:
+                    continue
+
+                link = urljoin(page_url, value)
+                parsed = urlparse(link)
+
+                if parsed.scheme not in {
+                    "http",
+                    "https",
+                }:
+                    continue
+
+                link = urlunparse((
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    "",
+                ))
+
+                if self.same_origin(link):
+                    links.add(link)
+
+        return links
+
+    def scan_page(self, url):
+        print(f"[*] Scanning {url}")
+
+        response = self.request(url)
+
+        if not response:
+            return set()
+
+        content_type = response.headers.get(
+            "Content-Type",
+            "",
+        )
+
+        if "text/html" not in content_type.lower():
+            return set()
+
+        final_url = response.url
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser",
+        )
+
+        self.inspect_reflection(final_url)
+        self.inspect_inline_scripts(
+            soup,
+            final_url,
+        )
+        self.inspect_external_scripts(
+            soup,
+            final_url,
+        )
+        self.inspect_forms(
+            soup,
+            final_url,
+        )
+
+        return self.extract_links(
+            soup,
+            final_url,
+        )
+
+    def crawl(self):
+        queue = deque([self.base_url])
+
+        while queue and len(self.visited) < self.max_pages:
+            url = queue.popleft()
+
+            if url in self.visited:
+                continue
+
+            self.visited.add(url)
+
+            links = self.scan_page(url)
+
+            for link in links:
+                if link not in self.visited:
+                    queue.append(link)
+
+    def save_report(self, filename):
+        output = Path(filename)
+
+        with output.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            f.write("XSS CANDIDATE REPORT\n")
+            f.write("=" * 80 + "\n\n")
+
+            f.write(
+                f"Pages scanned: "
+                f"{len(self.visited)}\n"
+            )
+
+            f.write(
+                f"Candidates: "
+                f"{len(self.findings)}\n\n"
+            )
+
+            for number, finding in enumerate(
+                self.findings,
+                1,
+            ):
+                f.write(
+                    f"[{number}] "
+                    f"{finding['type']}\n"
+                )
+
+                f.write(
+                    f"URL: "
+                    f"{finding['url']}\n"
+                )
+
+                f.write(
+                    f"Evidence: "
+                    f"{finding['evidence']}\n"
+                )
+
+                f.write(
+                    "-" * 80
+                    + "\n"
+                )
+
+        print(f"\n[+] Report written to {output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Authorized XSS candidate scanner"
+        )
+    )
+
+    parser.add_argument(
+        "url",
+        help="Base URL to scan",
+    )
+
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=50,
+        help="Maximum number of pages to crawl",
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--output",
+        default="xss_report.txt",
+    )
+
+    args = parser.parse_args()
+
+    scanner = XSSScanner(
+        args.url,
+        max_pages=args.max_pages,
+        timeout=args.timeout,
+    )
+
+    scanner.crawl()
+    scanner.save_report(args.output)
+
+
+if __name__ == "__main__":
+    main()
